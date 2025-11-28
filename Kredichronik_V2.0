@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+Kredichronik V2.0
+- Pip-Boy-Farbpalette (durchgehend grün für normalen Text)
+- Ordnerstruktur / JSON-Speicherung (Variante C)
+- Klassen-Boni, XP & Level-System
+- Einkommen, fixe & variable Ausgaben
+- Farbige Budget-Warnung (rot/gelb/grün)
+- ASCII Pip-Boy UI
+"""
+
+import os
+import json
+import datetime
+import random
+import shutil
+from pathlib import Path
+
+# -----------------------------
+# Konfiguration & Farben
+# -----------------------------
+DATA_DIR = Path.home() / "kredichronik"
+PROFILE_FILE = DATA_DIR / "profil.json"
+AUSGABEN_FILE = DATA_DIR / "ausgaben.json"
+TRIGGER_FILE = DATA_DIR / "trigger.json"
+SYSTEM_FILE = DATA_DIR / "system.json"
+
+# ANSI Farben (Pip-Boy-Look: normal text in green)
+GREEN = "\033[92m"
+DARK_GREEN = "\033[32m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+# Budget thresholds (in percentage)
+THRESHOLD_CRITICAL_PERCENT = 5.0   # <5% -> ROT
+THRESHOLD_WARNING_PERCENT = 15.0   # 5-15% -> GELB
+MIN_SAFE_EUROS = 20.0              # zusätzlich: <20€ kritische Meldung
+
+# XP rules
+BASE_XP_NEW_EXPENSE = 5
+BASE_XP_NEW_TRIGGER = 3
+BASE_XP_FIX_EXPENSE = 10
+BASE_XP_VAR_EXPENSE = 5
+IMPROV_BONUS_CHANCE = 0.20  # 20% chance
+IMPROV_BONUS_XP = 15
+VAMPIRIN_DISCOUNT = 0.10   # 10% discount on variable expenses
+PLANERIN_BONUS_XP = 10
+ZOMBIE_DAILY_XP = 1
+
+# Level formula: needed_xp = level * 100
+
+# -----------------------------
+# Default Data Templates
+# -----------------------------
+DEFAULT_PROFILE = {
+    "name": "Unbenannt",
+    "klasse": None,
+    "level": 1,
+    "xp": 0,
+    "monatliches_einkommen": 0.0,
+    "startdatum": str(datetime.date.today()),
+    "last_login": None
+}
+
+DEFAULT_SYSTEM = {
+    "created_at": str(datetime.date.today()),
+    "version": "2.0"
+}
+
+# -----------------------------
+# Klassen Definitionen & Boni
+# -----------------------------
+KLASSEN = {
+    "Planerin": {
+        "beschreibung": "Struktur und Planung sind dein Ding. Perfektion mit Excel.",
+        "bonus": "planerin",
+    },
+    "Improvisatorin": {
+        "beschreibung": "Improvisationstalent — aus wenig viel machen.",
+        "bonus": "improvisatorin",
+    },
+    "Rabatt-Vampirin": {
+        "beschreibung": "Coupons, Deals, Schnäppchenjagd – immer auf der Suche.",
+        "bonus": "vampirin",
+    },
+    "Budget-Zombie": {
+        "beschreibung": "Hartnäckig und ausdauernd. Überlebt alles mit Kaffee.",
+        "bonus": "zombie",
+    },
+}
+
+# -----------------------------
+# Hilfsfunktionen: Laden/Speichern
+# -----------------------------
+def ensure_data_dir():
+    if not DATA_DIR.exists():
+        DATA_DIR.mkdir(parents=True)
+    # ensure files exist
+    if not PROFILE_FILE.exists():
+        save_json(PROFILE_FILE, DEFAULT_PROFILE)
+    if not AUSGABEN_FILE.exists():
+        save_json(AUSGABEN_FILE, [])
+    if not TRIGGER_FILE.exists():
+        save_json(TRIGGER_FILE, [])
+    if not SYSTEM_FILE.exists():
+        save_json(SYSTEM_FILE, DEFAULT_SYSTEM)
+
+
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_all():
+    profile = load_json(PROFILE_FILE) or DEFAULT_PROFILE.copy()
+    ausgaben = load_json(AUSGABEN_FILE) or []
+    trigger = load_json(TRIGGER_FILE) or []
+    system = load_json(SYSTEM_FILE) or DEFAULT_SYSTEM.copy()
+    return profile, ausgaben, trigger, system
+
+
+# -----------------------------
+# XP / Level Management
+# -----------------------------
+def xp_needed_for_next(level):
+    return level * 100
+
+
+def add_xp(profile, amount):
+    profile["xp"] += int(amount)
+    leveled = False
+    while profile["xp"] >= xp_needed_for_next(profile["level"]):
+        profile["xp"] -= xp_needed_for_next(profile["level"])
+        profile["level"] += 1
+        leveled = True
+        print(f"{GREEN}{BOLD}\n🏆 LEVEL UP! Du bist jetzt Level {profile['level']}!{RESET}")
+        apply_level_reward(profile)
+    return leveled
+
+
+def apply_level_reward(profile):
+    # Beispiel-Belohnungen (erweiterbar)
+    perk = None
+    if profile["level"] == 2:
+        perk = "Perk: +5% XP auf Trigger"
+    elif profile["level"] == 5:
+        perk = "Perk: +1 automatischer Spar-Tipp pro Woche"
+    if perk:
+        print(f"{GREEN}{perk}{RESET}")
+
+
+# -----------------------------
+# Utility: Pretty Print / ASCII UI
+# -----------------------------
+def header():
+    print(GREEN + "+" + "-" * 38 + "+")
+    print("|" + " " * 14 + "Vault-Tec™ KREDICHRONIK" + " " * 7 + "|")
+    print("+" + "-" * 38 + "+" + RESET)
+
+
+def footer():
+    print(GREEN + "+" + "-" * 38 + "+" + RESET)
+
+
+def colored_budget_print(rest, percent):
+    # Determine color and print with messages
+    if rest < 0:
+        color = RED
+        msg = "KRITISCH: Budget überschritten – Sofortmaßnahmen empfohlen!"
+    elif percent < THRESHOLD_CRITICAL_PERCENT or rest < MIN_SAFE_EUROS:
+        color = RED
+        msg = "⚠️ Kritische Ressourcenlage – reduziere Ausgaben!"
+    elif percent < THRESHOLD_WARNING_PERCENT:
+        color = YELLOW
+        msg = "⚠️ Vorsicht: Budget schrumpft. Beobachte deine Ausgaben."
+    else:
+        color = GREEN
+        msg = "🟢 Finanzen stabil – weiter so."
+    print(f"{GREEN}RESTBUDGET: {color}{rest:.2f}€ ({percent:.1f}%){RESET}")
+    print(f"{color}{msg}{RESET}")
+
+
+# -----------------------------
+# Main Funktionen (Menü Aktionen)
+# -----------------------------
+def set_profile_basic(profile):
+    print(GREEN + "=== Profil einrichten ===" + RESET)
+    name = input(f"{GREEN}Dein Name [{profile.get('name')}]: {RESET}").strip()
+    if name:
+        profile["name"] = name
+    # Klasse wählen, falls noch keine gesetzt
+    if not profile.get("klasse"):
+        print(GREEN + "Wähle eine Klasse:" + RESET)
+        for i, k in enumerate(KLASSEN.keys(), start=1):
+            print(f"{GREEN}{i}. {k} - {KLASSEN[k]['beschreibung']}{RESET}")
+        while True:
+            try:
+                choice = int(input(f"{GREEN}Deine Wahl (1-{len(KLASSEN)}): {RESET}"))
+                if 1 <= choice <= len(KLASSEN):
+                    profile["klasse"] = list(KLASSEN.keys())[choice - 1]
+                    break
+            except ValueError:
+                pass
+            print(f"{GREEN}Ungültig, versuch's nochmal.{RESET}")
+    # Einkommen
+    while True:
+        try:
+            eink = input(f"{GREEN}Monatliches Nettoeinkommen in Euro [{profile.get('monatliches_einkommen', 0):.2f}]: {RESET}")
+            if eink.strip() == "":
+                break
+            eink_val = float(eink.replace(",", "."))
+            profile["monatliches_einkommen"] = round(eink_val, 2)
+            break
+        except ValueError:
+            print(f"{GREEN}Bitte Zahl eingeben (z.B. 1600.00).{RESET}")
+    print(f"{GREEN}Profil gespeichert. Willkommen, {profile['name']} ({profile['klasse']})!{RESET}")
+
+
+def add_income(profile):
+    while True:
+        try:
+            eink = input(f"{GREEN}Neues monatliches Einkommen eingeben (aktuell {profile.get('monatliches_einkommen', 0):.2f}): {RESET}")
+            if eink.strip() == "":
+                print(f"{GREEN}Keine Änderung vorgenommen.{RESET}")
+                return
+            val = float(eink.replace(",", "."))
+            profile["monatliches_einkommen"] = round(val, 2)
+            print(f"{GREEN}Monatliches Einkommen auf {profile['monatliches_einkommen']:.2f}€ gesetzt.{RESET}")
+            return
+        except ValueError:
+            print(f"{GREEN}Ungültige Eingabe. Bitte Zahl eingeben.{RESET}")
+
+
+def neue_ausgabe(profile, ausgaben):
+    print(GREEN + "\n--- Neue Ausgabe eintragen ---" + RESET)
+    kategorie = input(f"{GREEN}Kategorie (z.B. Miete, Lebensmittel, Kleidung): {RESET}").strip() or "Allgemein"
+    # Fix / Variabel
+    art = None
+    while art not in ("1", "2"):
+        art = input(f"{GREEN}Art der Ausgabe: 1) Fix  2) Variabel  => {RESET}")
+    is_fix = art == "1"
+    # Betrag
+    while True:
+        try:
+            raw = input(f"{GREEN}Betrag in Euro: {RESET}").strip().replace(",", ".")
+            betrag = float(raw)
+            break
+        except ValueError:
+            print(f"{GREEN}Bitte gültigen Betrag eingeben (z.B. 49.90).{RESET}")
+
+    # Rabatt-Vampirin automatisch anwenden auf variable Ausgaben
+    original_betrag = betrag
+    klasse = profile.get("klasse")
+    if not is_fix and klasse == "Rabatt-Vampirin":
+        betrag = round(betrag * (1 - VAMPIRIN_DISCOUNT), 2)
+        print(f"{GREEN}🧛 Rabatt-Vampirin aktiviert: Original {original_betrag:.2f}€ -> Neuer Betrag {betrag:.2f}€{RESET}")
+
+    datum = str(datetime.date.today())
+    eintrag = {
+        "datum": datum,
+        "kategorie": kategorie,
+        "betrag": round(betrag, 2),
+        "fix": is_fix,
+        "original_betrag": round(original_betrag, 2)
+    }
+    ausgaben.append(eintrag)
+    print(f"{GREEN}✓ Ausgabe {eintrag['betrag']:.2f}€ für '{kategorie}' ({'Fix' if is_fix else 'Variabel'}) gespeichert.{RESET}")
+
+    # XP vergeben
+    xp_gain = BASE_XP_FIX_EXPENSE if is_fix else BASE_XP_VAR_EXPENSE
+    # Planerin Bonus for fixed expenses
+    if is_fix and klasse == "Planerin":
+        xp_gain += PLANERIN_BONUS_XP
+        print(f"{GREEN}Planerin-Bonus: +{PLANERIN_BONUS_XP} XP für fixe Ausgabe.{RESET}")
+    # Improvisatorin chance on variable
+    if not is_fix and klasse == "Improvisatorin":
+        if random.random() < IMPROV_BONUS_CHANCE:
+            xp_gain += IMPROV_BONUS_XP
+            print(f"{GREEN}Chaos hat sich gelohnt! +{IMPROV_BONUS_XP} Bonus-XP für Improvisatorin.{RESET}")
+    add_xp(profile, xp_gain)
+    save_json(AUSGABEN_FILE, ausgaben)
+    save_json(PROFILE_FILE, profile)
+
+
+def neuer_trigger(profile, trigger):
+    print(GREEN + "\n--- Neue Notiz/Trigger eintragen ---" + RESET)
+    notiz = input(f"{GREEN}Was hat dich heute getriggert oder beschäftigt?: {RESET}").strip()
+    datum = str(datetime.date.today())
+    eintrag = {"datum": datum, "notiz": notiz}
+    trigger.append(eintrag)
+    print(f"{GREEN}✓ Notiz gespeichert.{RESET}")
+    # XP für Trigger
+    add_xp(profile, BASE_XP_NEW_TRIGGER)
+    save_json(TRIGGER_FILE, trigger)
+    save_json(PROFILE_FILE, profile)
+
+
+def berechne_summen(ausgaben, monatliches_einkommen):
+    sum_fix = sum(e["betrag"] for e in ausgaben if e.get("fix"))
+    sum_var = sum(e["betrag"] for e in ausgaben if not e.get("fix"))
+    total = sum_fix + sum_var
+    rest = round(monatliches_einkommen - total, 2)
+    percent = (rest / monatliches_einkommen * 100.0) if monatliches_einkommen > 0 else 0.0
+    return sum_fix, sum_var, total, rest, percent
+
+
+def anzeigen(profile, ausgaben, trigger):
+    print()
+    header()
+    print(f"{GREEN}Benutzer: {profile.get('name')}  |  Klasse: {profile.get('klasse')}  |  Level: {profile.get('level')}  |  XP: {profile.get('xp')}/{xp_needed_for_next(profile.get('level'))}{RESET}")
+    print(GREEN + "-" * 40 + RESET)
+    einkommen = profile.get("monatliches_einkommen", 0.0)
+    sum_fix, sum_var, total, rest, percent = berechne_summen(ausgaben, einkommen)
+    print(f"{GREEN}Monatliches Einkommen: {einkommen:.2f}€{RESET}")
+    print(f"{GREEN}Summe fixe Ausgaben:   {sum_fix:.2f}€{RESET}")
+    print(f"{GREEN}Summe variable Ausgaben:{sum_var:.2f}€{RESET}")
+    print(f"{GREEN}Gesamtausgaben:        {total:.2f}€{RESET}")
+    colored_budget_print(rest, percent)
+    print(GREEN + "-" * 40 + RESET)
+
+    # Zeige neueste Ausgaben (letzte 10)
+    print(GREEN + "\nLetzte Ausgaben (neueste zuerst):" + RESET)
+    for e in list(reversed(ausgaben))[:10]:
+        typ = "Fix" if e.get("fix") else "Variabel"
+        orig = f" (orig {e.get('original_betrag'):.2f}€)" if e.get("original_betrag") and e.get("original_betrag") != e.get("betrag") else ""
+        print(f"{GREEN}{e.get('datum')} - {e.get('kategorie')} - {e.get('betrag'):.2f}€ {typ}{orig}{RESET}")
+
+    # Trigger anzeigen
+    print(GREEN + "\n--- Trigger / Notizen ---" + RESET)
+    for t in list(reversed(trigger))[:10]:
+        print(f"{GREEN}{t.get('datum')} - {t.get('notiz')}{RESET}")
+
+    footer()
+
+
+def show_profile(profile):
+    print()
+    header()
+    print(f"{GREEN}Name: {profile.get('name')}{RESET}")
+    print(f"{GREEN}Klasse: {profile.get('klasse')}{RESET}")
+    print(f"{GREEN}Level: {profile.get('level')}  |  XP: {profile.get('xp')}/{xp_needed_for_next(profile.get('level'))}{RESET}")
+    print(f"{GREEN}Monatliches Einkommen: {profile.get('monatliches_einkommen'):.2f}€{RESET}")
+    print(f"{GREEN}Startdatum: {profile.get('startdatum')}{RESET}")
+    footer()
+
+
+def backup_data():
+    bak_dir = DATA_DIR / "backup"
+    bak_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    for fname in (PROFILE_FILE, AUSGABEN_FILE, TRIGGER_FILE, SYSTEM_FILE):
+        if fname.exists():
+            shutil.copy(fname, bak_dir / f"{fname.stem}_{timestamp}.json")
+    print(f"{GREEN}Backup erstellt in {bak_dir}{RESET}")
+
+
+def daily_zombie_bonus(profile):
+    # Wenn Budget-Zombie: 1 XP pro neuem Tag (letzter login < heute)
+    last = profile.get("last_login")
+    today = str(datetime.date.today())
+    if profile.get("klasse") == "Budget-Zombie" and last != today:
+        profile["xp"] += ZOMBIE_DAILY_XP
+        profile["last_login"] = today
+        print(f"{GREEN}Budget-Zombie: +{ZOMBIE_DAILY_XP} XP fürs Überleben heute!{RESET}")
+        save_json(PROFILE_FILE, profile)
+
+
+# -----------------------------
+# Main Menü
+# -----------------------------
+def main_menu():
+    ensure_data_dir()
+    profile, ausgaben, trigger, system = load_all()
+
+    # Setup if fresh
+    if not profile.get("klasse") or profile.get("name", "Unbenannt") == "Unbenannt":
+        set_profile_basic(profile)
+        save_json(PROFILE_FILE, profile)
+
+    # daily bonuses
+    daily_zombie_bonus(profile)
+
+    while True:
+        print()
+        header()
+        print(f"{GREEN}Hallo {profile.get('name')} — Klasse: {profile.get('klasse')}  |  Level {profile.get('level')} ({profile.get('xp')} XP){RESET}")
+        print(GREEN + "-" * 40 + RESET)
+        print(f"{GREEN}1) Ausgabe eintragen{RESET}")
+        print(f"{GREEN}2) Notiz / Trigger eintragen{RESET}")
+        print(f"{GREEN}3) Übersicht (Budget-Scanner){RESET}")
+        print(f"{GREEN}4) Profil anzeigen / Einkommen bearbeiten{RESET}")
+        print(f"{GREEN}5) Backup erstellen{RESET}")
+        print(f"{GREEN}6) Daten exportieren als CSV (Ordner 'export'){RESET}")
+        print(f"{GREEN}7) Programm beenden (speichern){RESET}")
+        footer()
+
+        choice = input(f"{GREEN}Deine Auswahl: {RESET}").strip()
+        if choice == "1":
+            neue_ausgabe(profile, ausgaben)
+        elif choice == "2":
+            neuer_trigger(profile, trigger)
+        elif choice == "3":
+            anzeigen(profile, ausgaben, trigger)
+        elif choice == "4":
+            show_profile(profile)
+            sub = input(f"{GREEN}Möchtest du Einkommen ändern? (j/n): {RESET}").strip().lower()
+            if sub == "j":
+                add_income(profile)
+                save_json(PROFILE_FILE, profile)
+        elif choice == "5":
+            backup_data()
+        elif choice == "6":
+            export_as_csv(ausgaben, trigger, profile)
+        elif choice == "7":
+            # Save all and exit
+            save_json(PROFILE_FILE, profile)
+            save_json(AUSGABEN_FILE, ausgaben)
+            save_json(TRIGGER_FILE, trigger)
+            save_json(SYSTEM_FILE, system)
+            print(f"{GREEN}💾 Daten gespeichert. Denk dran: Du bist mehr als deine Quittung.{RESET}")
+            break
+        else:
+            print(f"{GREEN}Ungültige Auswahl. Versuch's nochmal.{RESET}")
+
+
+# -----------------------------
+# Export-Funktion (CSV)
+# -----------------------------
+def export_as_csv(ausgaben, trigger, profile):
+    exp_dir = DATA_DIR / "export"
+    exp_dir.mkdir(exist_ok=True)
+    import csv
+    # Ausgaben
+    with open(exp_dir / "ausgaben.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["datum", "kategorie", "betrag", "fix", "original_betrag"])
+        for e in ausgaben:
+            writer.writerow([e.get("datum"), e.get("kategorie"), f"{e.get('betrag'):.2f}", e.get("fix"), f"{e.get('original_betrag'):.2f}"])
+    # Trigger
+    with open(exp_dir / "trigger.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["datum", "notiz"])
+        for t in trigger:
+            writer.writerow([t.get("datum"), t.get("notiz")])
+    # Profile
+    with open(exp_dir / "profil.txt", "w", encoding="utf-8") as f:
+        f.write(json.dumps(profile, indent=2, ensure_ascii=False))
+    print(f"{GREEN}Export fertig! Dateien in: {exp_dir}{RESET}")
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print(f"\n{GREEN}Programm unterbrochen. Speichere Daten...{RESET}")
+        ensure_data_dir()
+        # attempt to save minimal safe state
+        profile, ausgaben, trigger, system = load_all()
+        save_json(PROFILE_FILE, profile)
+        save_json(AUSGABEN_FILE, ausgaben)
+        save_json(TRIGGER_FILE, trigger)
+        print(f"{GREEN}Gespeichert. Bye!{RESET}")
