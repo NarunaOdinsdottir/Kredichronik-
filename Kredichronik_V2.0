@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Kredichronik V2.0
 - Pip-Boy-Farbpalette (durchgehend grün für normalen Text)
@@ -304,6 +303,17 @@ def neuer_trigger(profile, trigger):
     save_json(TRIGGER_FILE, trigger)
     save_json(PROFILE_FILE, profile)
 
+def filter_ausgaben_aktueller_monat(ausgaben):
+    heute = datetime.date.today()
+    aktueller_monat = heute.month
+    aktuelles_jahr = heute.year
+    gefilterte_ausgaben = [
+        e for e in ausgaben
+        if datetime.date.fromisoformat(e["datum"]).month == aktueller_monat and
+           datetime.date.fromisoformat(e["datum"]).year == aktuelles_jahr
+    ]
+    return gefilterte_ausgaben
+
 
 def berechne_summen(ausgaben, monatliches_einkommen):
     sum_fix = sum(e["betrag"] for e in ausgaben if e.get("fix"))
@@ -320,7 +330,8 @@ def anzeigen(profile, ausgaben, trigger):
     print(f"{GREEN}Benutzer: {profile.get('name')}  |  Klasse: {profile.get('klasse')}  |  Level: {profile.get('level')}  |  XP: {profile.get('xp')}/{xp_needed_for_next(profile.get('level'))}{RESET}")
     print(GREEN + "-" * 40 + RESET)
     einkommen = profile.get("monatliches_einkommen", 0.0)
-    sum_fix, sum_var, total, rest, percent = berechne_summen(ausgaben, einkommen)
+    ausgaben_monat = filter_ausgaben_aktueller_monat(ausgaben)
+    sum_fix, sum_var, total, rest, percent = berechne_summen(ausgaben_monat, einkommen)
     print(f"{GREEN}Monatliches Einkommen: {einkommen:.2f}€{RESET}")
     print(f"{GREEN}Summe fixe Ausgaben:   {sum_fix:.2f}€{RESET}")
     print(f"{GREEN}Summe variable Ausgaben:{sum_var:.2f}€{RESET}")
