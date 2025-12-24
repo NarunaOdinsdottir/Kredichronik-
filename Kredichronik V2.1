@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 23:28:49 2025
+
+Kredichronik V2.1 (Fixed & Integrated - neue Funktion: Sparplan - Superfonds)
+- Pip-Boy-Farbpalette
+- Ordnerstruktur / JSON-Speicherung
+- Klassen-Boni, XP & Level-System
+- Einkommen, fixe & variable Ausgaben
+- Farbige Budget-Warnung
+- Monte-Carlo-Simulation (NumPy Vektorisierung)
+- CSV Export & Backup
+- ASCII Pip-Boy UI
+"""
+
+import os
+import json
+import datetime
+import random
+import shutil
+import statistics
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+import numpy as np
+
+# -----------------------------
+# Konfiguration & Farben
+# -----------------------------
+DATA_DIR = Path.home() / "kredichronik"
+PROFILE_FILE = DATA_DIR / "profil.json"
+AUSGABEN_FILE = DATA_DIR / "ausgaben.json"
+TRIGGER_FILE = DATA_DIR / "trigger.json"
+SYSTEM_FILE = DATA_DIR / "system.json"
+SPAR_FILE = DATA_DIR / "spar.json"
+
+# ANSI Farben (Pip-Boy-Look)
+GREEN = "\033[92m"
+DARK_GREEN = "\033[32m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+# Budget thresholds (in percentage)
+THRESHOLD_CRITICAL_PERCENT = 5.0  # <5% -> ROT
+THRESHOLD_WARNING_PERCENT = 15.0  # 5-15% -> GELB
+MIN_SAFE_EUROS = 20.0    # zusätzlich: <20€ kritische Meldung
+
+# XP rules
+BASE_XP_NEW_EXPENSE = 5
+BASE_XP_NEW_TRIGGER = 3
+BASE_XP_FIX_EXPENSE = 10
+BASE_XP_VAR_EXPENSE = 5
+IMPROV_BONUS_CHANCE = 0.20 # 20% chance
+IMPROV_BONUS_XP = 15
+VAMPIRIN_DISCOUNT = 0.10   # 10% discount on variable expenses
+PLANERIN_BONUS_XP = 10
+ZOMBIE_DAILY_XP = 1
+
+# Level formula: needed_xp = level * 100
+
+# -----------------------------
+# Default Data Templates
+# -----------------------------
+DEFAULT_PROFILE = {
+    "name": "Unbenannt",
+    "klasse": None,
+    "level": 1,
+    "xp": 0,
+    "monatliches_einkommen": 0.0,
+    "startdatum": str(datetime.date.today()),
+    "last_login": None
+}
+
+DEFAULT_SPAR = {
+    "monthly_contribution": 50.0,
+    "years": 10,
+    "n_simulations": 10000,
+    "initial_balance": 0.0,
+    "annual_return_mean": 0.07,  # 7% p.a.
+    "annual_return_std": 0.15,   # 15% Volatilität
+    "annual_fee_pct": 0.25,      # 0.25% TER
+    "last_summary": {},          # Speicherort für Ergebnisse
+    "contribution_timing": "start"
+}
+
+DEFAULT_SYSTEM = {
+    "created_at": str(datetime.date.today()),
+    "version": "2.1"
+}
+
+# -----------------------------
+# Klassen Definitionen & Boni
+# -----------------------------
+KLASSEN = {
+    "Planerin": {
+        "beschreibung": "Struktur und Planung sind dein Ding. Perfektion mit Excel.",
+        "bonus": "planerin",
+        "risiko": {
+            "level": 2,
+            "name": "Vault-Overseerin der Tabellenkalkulation",
+            "kurz": "defensiv",
+            "claim": "Risiko? Nur nach Freigabeformular in dreifacher Ausführung."
+        },
+    },
+    "Improvisatorin": {
+        "beschreibung": "Improvisationstalent — aus wenig viel machen.",
+        "bonus": "improvisatorin",
+        "risiko": {
+            "level": 4,
+            "name": "Notfall-Technikerin (‚Hält bestimmt‘)",
+            "kurz": "hoch",
+            "claim": "Wenn’s wackelt, wariptide-Tape drauf. Gilt auch fürs Depot."
+        },
+    },
+    "Rabatt-Vampirin": {
+        "beschreibung": "Coupons, Deals, Schnäppchenjagd – immer auf der Suche.",
+        "bonus": "vampirin",
+        "risiko": {
+            "level": 3,
+            "name": "Kassenbon-Nekromantin",
+            "kurz": "moderat",
+            "claim": "Ich beschwöre Rabatte aus abgelaufenen Coupons."
+        },
+    },
+    "Budget-Zombie": {
+        "beschreibung": "Hartnäckig und ausdauernd. Überlebt alles mit Kaffee.",
+        "bonus": "zombie",
+        "risiko": {
+            "level": 1,
+            "name": "Rationszombie mit Koffeinantrieb",
+            "kurz": "sehr defensiv",
+            "claim": "Überleben first. Rendite darf sich hinten anstellen."
+        },
+    },
+}
+
+
+# -----------------------------
+# Hilfsfunktionen: Laden/Speichern
+# -----------------------------
+def ensure_data_dir():
+    """Erstellt den Datenordner und die Standarddateien, falls sie nicht existieren."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    files_to_create = [
+        (PROFILE_FILE, DEFAULT_PROFILE),
+        (AUSGABEN_FILE, []),
+        (TRIGGER_FILE, []),
+        (SYSTEM_FILE, DEFAULT_SYSTEM),
+        (SPAR_FILE, DEFAULT_SPAR)
+    ]
+    
+    for file_path, default_data in files_to_create:
+        if not file_path.exists():
+            save_json(file_path, default_data)
+
+
+def load_json(path: Path) -> Optional[Any]:
+    """Lädt JSON-Daten aus einer Datei mit Fehlerbehandlung."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        # Return None so calling functions can handle defaults
+        return None
+
+
+def save_json(path: Path, data: Any) -> bool:
+    """Speichert Daten in einer JSON-Datei."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"{RED}Fehler beim Speichern in {path.name}: {e}{RESET}")
+        return False
+
+
+def load_all() -> Tuple[Dict, List, List, Dict, Dict]:
+    """Lädt alle Daten und gibt sie zurück."""
+    profile = load_json(PROFILE_FILE) or DEFAULT_PROFILE.copy()
+    ausgaben = load_json(AUSGABEN_FILE) or []
+    trigger = load_json(TRIGGER_FILE) or []
+    system = load_json(SYSTEM_FILE) or DEFAULT_SYSTEM.copy()
+    spar = load_json(SPAR_FILE) or DEFAULT_SPAR.copy()
+    return profile, ausgaben, trigger, system, spar
+
+
+# -----------------------------
+# XP / Level Management
+# -----------------------------
+def xp_needed_for_next(level: int) -> int:
+    return level * 100
+
+
+def add_xp(profile: Dict, amount: int) -> bool:
+    profile["xp"] += int(amount)
+    leveled = False
+    
+    while profile["xp"] >= xp_needed_for_next(profile["level"]):
+        profile["xp"] -= xp_needed_for_next(profile["level"])
+        profile["level"] += 1
+        leveled = True
+        print(f"{GREEN}{BOLD}\n🏆 LEVEL UP! Du bist jetzt Level {profile['level']}!{RESET}")
+        apply_level_reward(profile)
+    
+    return leveled
+
+
+def apply_level_reward(profile: Dict) -> None:
+    perk = None
+    if profile["level"] == 2:
+        perk = "Perk: +5% XP auf Trigger"
+    elif profile["level"] == 5:
+        perk = "Perk: +1 automatischer Spar-Tipp pro Woche"
+    
+    if perk:
+        print(f"{GREEN}{perk}{RESET}")
+
+
+# -----------------------------
+# Utility: Pretty Print / ASCII UI
+# -----------------------------
+def header() -> None:
+    print(GREEN + "+" + "-" * 54 + "+" + RESET)
+    print(GREEN + "|" + " " * 10 + "Vault-Tec™ KREDICHRONIK & SUPERFONDS" + " " * 9 + "|" + RESET)
+    print(GREEN + "+" + "-" * 54 + "+" + RESET)
+
+
+def footer() -> None:
+    print(GREEN + "+" + "-" * 60 + "+" + RESET)
+
+
+def colored_budget_print(rest: float, percent: float) -> None:
+    if rest < 0:
+        color = RED
+        msg = "KRITISCH: Budget überschritten – Sofortmaßnahmen empfohlen!"
+    elif percent < THRESHOLD_CRITICAL_PERCENT or rest < MIN_SAFE_EUROS:
+        color = RED
+        msg = "⚠️ Kritische Ressourcenlage – reduziere Ausgaben!"
+    elif percent < THRESHOLD_WARNING_PERCENT:
+        color = YELLOW
+        msg = "⚠️ Vorsicht: Budget schrumpft. Beobachte deine Ausgaben."
+    else:
+        color = GREEN
+        msg = "🟢 Finanzen stabil – weiter so."
+    
+    print(f"{GREEN}RESTBUDGET: {color}{rest:.2f}€ ({percent:.1f}%){RESET}")
+    print(f"{color}{msg}{RESET}")
+
+
+# -----------------------------
+# Main Funktionen (Menü Aktionen)
+# -----------------------------
+def set_profile_basic(profile: Dict) -> None:
+    print(GREEN + "=== Profil einrichten ===" + RESET)
+    name = input(f"{GREEN}Dein Name [{profile.get('name')}]: {RESET}").strip()
+    if name:
+        profile["name"] = name
+    
+    # Klasse wählen, falls noch nicht gesetzt
+    if not profile.get("klasse"):
+        print(GREEN + "Wähle eine Klasse:" + RESET)
+        sorted_keys = list(KLASSEN.keys())
+        for i, k in enumerate(sorted_keys, start=1):
+            print(f"{GREEN}{i}. {k} - {KLASSEN[k]['beschreibung']}{RESET}")
+        
+        while True:
+            try:
+                choice = int(input(f"{GREEN}Deine Wahl (1-{len(sorted_keys)}): {RESET}"))
+                if 1 <= choice <= len(sorted_keys):
+                    profile["klasse"] = sorted_keys[choice - 1]
+                    break
+            except (ValueError, IndexError):
+                pass
+            print(f"{GREEN}Ungültig, versuch's nochmal.{RESET}")
+    
+    # Einkommen
+    add_income(profile)
+    
+    print(f"{GREEN}Profil gespeichert. Willkommen, {profile['name']} ({profile['klasse']})!{RESET}")
+
+
+def add_income(profile: Dict) -> None:
+    while True:
+        try:
+            current = profile.get('monatliches_einkommen', 0)
+            eink = input(f"{GREEN}Monatliches Nettoeinkommen in Euro [{current:.2f}]: {RESET}")
+            if eink.strip() == "":
+                # Keine Änderung
+                return
+            val = float(eink.replace(",", "."))
+            profile["monatliches_einkommen"] = round(val, 2)
+            print(f"{GREEN}Monatliches Einkommen auf {profile['monatliches_einkommen']:.2f}€ gesetzt.{RESET}")
+            return
+        except ValueError:
+            print(f"{GREEN}Ungültige Eingabe. Bitte Zahl eingeben.{RESET}")
+
+
+def neue_ausgabe(profile: Dict, ausgaben: List[Dict]) -> None:
+    print(GREEN + "\n--- Neue Ausgabe eintragen ---" + RESET)
+    kategorie = input(f"{GREEN}Kategorie (z.B. Miete, Lebensmittel) [Allgemein]: {RESET}").strip() or "Allgemein"
+    
+    art = None
+    while art not in ("1", "2"):
+        art = input(f"{GREEN}Art der Ausgabe: 1) Fix  2) Variabel  => {RESET}")
+    is_fix = art == "1"
+    # Betrag
+    while True:
+        try:
+            raw = input(f"{GREEN}Betrag in Euro: {RESET}").strip().replace(",", ".")
+            betrag = float(raw)
+            break
+        except ValueError:
+            print(f"{GREEN}Bitte gültigen Betrag eingeben (z.B. 49.90).{RESET}")
+
+    # Rabatt-Vampirin Logik - automatisch anwenden auf variable Ausgaben
+    original_betrag = betrag
+    klasse = profile.get("klasse")
+    if not is_fix and klasse == "Rabatt-Vampirin":
+        betrag = round(betrag * (1 - VAMPIRIN_DISCOUNT), 2)
+        print(f"{GREEN}🧛 Rabatt-Vampirin aktiviert: Original {original_betrag:.2f}€ -> Neuer Betrag {betrag:.2f}€{RESET}")
+
+    datum = str(datetime.date.today())
+    eintrag = {
+        "datum": datum,
+        "kategorie": kategorie,
+        "betrag": round(betrag, 2),
+        "fix": is_fix,
+        "original_betrag": round(original_betrag, 2)
+    }
+    ausgaben.append(eintrag)
+    print(f"{GREEN}✓ Ausgabe {eintrag['betrag']:.2f}€ für '{kategorie}' gespeichert.{RESET}")
+
+    # XP vergeben
+    xp_gain = BASE_XP_FIX_EXPENSE if is_fix else BASE_XP_VAR_EXPENSE
+    
+    if is_fix and klasse == "Planerin":
+        xp_gain += PLANERIN_BONUS_XP
+        print(f"{GREEN}Planerin-Bonus: +{PLANERIN_BONUS_XP} XP für fixe Ausgabe.{RESET}")
+    # Improvisatorin chance on variable
+    if not is_fix and klasse == "Improvisatorin":
+        if random.random() < IMPROV_BONUS_CHANCE:
+            xp_gain += IMPROV_BONUS_XP
+            print(f"{GREEN}Chaos hat sich gelohnt! +{IMPROV_BONUS_XP} Bonus-XP für Improvisatorin.{RESET}")
+    
+    add_xp(profile, xp_gain)
+    save_json(AUSGABEN_FILE, ausgaben)
+    save_json(PROFILE_FILE, profile)
+
+
+def neuer_trigger(profile: Dict, trigger: List[Dict]) -> None:
+    print(GREEN + "\n--- Neue Notiz/Trigger eintragen ---" + RESET)
+    notiz = input(f"{GREEN}Was hat dich heute getriggert oder beschäftigt?: {RESET}").strip()
+    if not notiz:
+        return
+        
+    datum = str(datetime.date.today())
+    eintrag = {"datum": datum, "notiz": notiz}
+    trigger.append(eintrag)
+    print(f"{GREEN}✓ Notiz gespeichert.{RESET}")
+    
+    add_xp(profile, BASE_XP_NEW_TRIGGER)
+    save_json(TRIGGER_FILE, trigger)
+    save_json(PROFILE_FILE, profile)
+
+
+def neuer_sparplan(profile: Dict, spar_config: Dict):
+    """
+    Simuliert einen ETF-Sparplan mit Monte-Carlo-Methode (Vektorisiert mit NumPy).
+    Abfrage von Startkapital, Rendite und Volatilität.
+    """
+    print(GREEN + "\n--- Monte-Carlo Simulations-Terminal ---" + RESET)
+    
+    try:
+        # --- 1. Eingabe der Parameter ---
+        
+        # Startkapital
+        def_bal = spar_config.get('initial_balance', 0.0)
+        in_bal = input(f"{GREEN}Startkapital [{def_bal:.2f}]: {RESET}")
+        initial_balance = float(in_bal.replace(',', '.')) if in_bal.strip() else def_bal
+
+        # Monatliche Sparrate
+        def_rate = spar_config.get('monthly_contribution', 50.0)
+        in_rate = input(f"{GREEN}Monatl. Rate [{def_rate:.2f}]: {RESET}")
+        monthly_contribution = float(in_rate.replace(',', '.')) if in_rate.strip() else def_rate
+
+        # Laufzeit in Jahren
+        def_yrs = spar_config.get('years', 10)
+        in_yrs = input(f"{GREEN}Jahre [{def_yrs}]: {RESET}")
+        years = int(in_yrs) if in_yrs.strip() else def_yrs
+
+        # Erwartete Rendite (Eingabe in %, intern Dezimal)
+        def_ret = spar_config.get('annual_return_mean', 0.07)
+        in_ret = input(f"{GREEN}Erwartete Rendite in % [{def_ret*100:.1f}]: {RESET}")
+        # Wenn User was eingibt: durch 100 teilen. Wenn nicht: Default nehmen.
+        annual_mean = (float(in_ret.replace(',', '.')) / 100.0) if in_ret.strip() else def_ret
+
+        # Volatilität (Eingabe in %, intern Dezimal)
+        def_vol = spar_config.get('annual_return_std', 0.15)
+        in_vol = input(f"{GREEN}Volatilität in % [{def_vol*100:.1f}]: {RESET}")
+        annual_std = (float(in_vol.replace(',', '.')) / 100.0) if in_vol.strip() else def_vol
+
+        # Simulationseinstellungen laden
+        n_simulations = spar_config.get('n_simulations', 10000)
+        annual_fee_pct = spar_config.get('annual_fee_pct', 0.25)
+        # Sicherheits-Fallback für contribution_timing
+        contribution_timing = spar_config.get('contribution_timing', 'start')
+        if contribution_timing not in ['start', 'end']:
+            contribution_timing = 'start'
+
+        # Config sofort aktualisieren, damit die Werte für nächstes Mal gespeichert sind
+        spar_config.update({
+            "monthly_contribution": monthly_contribution,
+            "years": years,
+            "initial_balance": initial_balance,
+            "annual_return_mean": annual_mean,
+            "annual_return_std": annual_std,
+            "contribution_timing": contribution_timing
+        })
+
+        # --- 2. Berechnungsvorbereitung ---
+        months = int(years * 12)
+        # Monatliche Gebühr (TER)
+        monthly_fee_rate = (annual_fee_pct / 100.0) / 12.0
+        
+        # Umrechnung Jahresrendite auf Monatsbasis (Geometrisch)
+        monthly_return_rate = (1.0 + annual_mean) ** (1.0 / 12.0) - 1.0
+        # Umrechnung Volatilität auf Monatsbasis (Wurzel-T-Regel)
+        monthly_std = annual_std / np.sqrt(12)
+        
+        print(f"{GREEN}Starte {n_simulations} Simulationen über {months} Monate...{RESET}")
+        print(f"{GREEN}(Parameter: Ø {annual_mean*100:.1f}% Return, {annual_std*100:.1f}% Vola, {monthly_contribution}€ Rate){RESET}")
+
+        # --- 3. Vektorisierte Simulation (NumPy) ---
+        
+        # Erzeuge eine Matrix mit zufälligen Renditen für ALLE Monate und ALLE Simulationen auf einmal
+        # Form: (n_simulations, months)
+        returns_matrix = np.random.normal(monthly_return_rate, monthly_std, (n_simulations, months))
+        
+        # Initialisiere Guthaben-Vektor (für jede Simulation ein Wert)
+        balances = np.full(n_simulations, float(initial_balance))
+        
+        # Zeit-Schleife (Monat für Monat)
+        for t in range(months):
+            # Einzahlung am Monatsanfang
+            if contribution_timing == 'start':
+                balances += monthly_contribution
+            
+            # Wende Markt-Rendite und Gebühr an
+            # Wir berechnen den Faktor für diesen Monat: (1 + Rendite - Gebühr)
+            growth_factor = 1.0 + returns_matrix[:, t] - monthly_fee_rate
+            balances = balances * growth_factor
+            
+            # Einzahlung am Monatsende
+            if contribution_timing == 'end':
+                balances += monthly_contribution
+                
+            # Kein negatives Guthaben (Totalverlust-Grenze)
+            balances = np.maximum(balances, 0)
+        
+        # --- 4. Auswertung ---
+        p50 = float(np.median(balances))
+        p05 = float(np.percentile(balances, 5))
+        p95 = float(np.percentile(balances, 95))
+        
+        summary = {
+            'p05': round(p05, 2),
+            'p50': round(p50, 2),
+            'p95': round(p95, 2),
+            'mean': round(float(np.mean(balances)), 2),
+            'timestamp': str(datetime.date.today())
+        }
+        
+        # Ergebnis speichern
+        spar_config["last_summary"] = summary
+        save_json(SPAR_FILE, spar_config)
+        
+        print(f"{GREEN}Simulation abgeschlossen.{RESET}")
+        print(f"{GREEN}Median-Ergebnis: {summary['p50']}€{RESET}")
+        print(f"{YELLOW}Worst Case (5%): {summary['p05']}€{RESET}")
+        print(f"{GREEN}Best Case (95%): {summary['p95']}€{RESET}")
+
+    except ValueError as e:
+        print(f"{RED}Eingabefehler: {e}{RESET}")
+    except Exception as e:
+        print(f"{RED}Unbekannter Fehler in Simulation: {e}{RESET}")
+
+
+def berechne_summen(ausgaben: List[Dict], monatliches_einkommen: float) -> Tuple[float, float, float, float, float]:
+    """Berechnet die Summen für Ausgaben."""
+    sum_fix = sum(e["betrag"] for e in ausgaben if e.get("fix"))
+    sum_var = sum(e["betrag"] for e in ausgaben if not e.get("fix"))
+    total = sum_fix + sum_var
+    rest = round(monatliches_einkommen - total, 2)
+    percent = (rest / monatliches_einkommen * 100.0) if monatliches_einkommen > 0 else 0.0
+    return sum_fix, sum_var, total, rest, percent
+
+
+def anzeigen(profile: Dict, ausgaben: List[Dict], spar: Dict, trigger: List[Dict]) -> None:
+    """Zeigt die Übersicht an."""
+    print()
+    header()
+    print(f"{GREEN}Benutzer: {profile.get('name')}  |  Typ: {profile.get('klasse')}  |  Level: {profile.get('level')}  |  XP: {profile.get('xp')}/{xp_needed_for_next(profile.get('level'))}{RESET}")
+    print(GREEN + "-" * 40 + RESET)
+    
+    einkommen = profile.get("monatliches_einkommen", 0.0)
+    sum_fix, sum_var, total, rest, percent = berechne_summen(ausgaben, einkommen)
+    
+    print(f"{GREEN}Monatliches Einkommen: {einkommen:.2f}€{RESET}")
+    print(f"{GREEN}Summe fixe Ausgaben:   {sum_fix:.2f}€{RESET}")
+    print(f"{GREEN}Summe variable Ausgaben:{sum_var:.2f}€{RESET}")
+    print(f"{GREEN}Gesamtausgaben:        {total:.2f}€{RESET}")
+    
+    # Spar-Anzeige repariert: Liest nun aus dem gespeicherten Summary
+    if spar.get("last_summary"):
+        summ = spar["last_summary"]
+        print(f"{GREEN}Proj. Depotwert ({spar.get('years')}J): {summ['p50']}€ (Median){RESET}")
+    else:
+        print(f"{YELLOW}Keine Spar-Simulation vorhanden.{RESET}")
+
+    colored_budget_print(rest, percent)
+    print(GREEN + "-" * 40 + RESET)
+
+    # Zeige neueste Ausgaben (letzte 10)
+    print(GREEN + "\nLetzte Ausgaben (neueste zuerst):" + RESET)
+    for e in list(reversed(ausgaben))[:10]:
+        typ = "Fix" if e.get("fix") else "Variabel"
+        orig = f" (orig {e.get('original_betrag'):.2f}€)" if e.get("original_betrag") and e.get("original_betrag") != e.get("betrag") else ""
+        print(f"{GREEN}{e.get('datum')} - {e.get('kategorie')} - {e.get('betrag'):.2f}€ {typ}{orig}{RESET}")
+
+    # Trigger anzeigen
+    print(GREEN + "\n--- Trigger / Notizen ---" + RESET)
+    for t in list(reversed(trigger))[:10]:
+        print(f"{GREEN}{t.get('datum')} - {t.get('notiz')}{RESET}")
+
+    footer()
+
+
+def show_profile(profile: Dict) -> None:
+    """Zeigt das Profil an."""
+    print()
+    header()
+    print(f"{GREEN}Name: {profile.get('name')}{RESET}")
+    print(f"{GREEN}Typ: {profile.get('klasse')}{RESET}")
+    if profile.get('klasse') in KLASSEN:
+        k_info = KLASSEN[profile['klasse']]
+        print(f"{GREEN}Info: {k_info['beschreibung']}{RESET}")
+        print(f"{GREEN}Risiko-Profil: {k_info['risiko']['name']} ({k_info['risiko']['kurz']}){RESET}")
+        print(f"{GREEN}Claim: \"{k_info['risiko']['claim']}\"{RESET}")
+    
+    print(f"{GREEN}Level: {profile.get('level')}  |  XP: {profile.get('xp')}/{xp_needed_for_next(profile.get('level'))}{RESET}")
+    print(f"{GREEN}Monatliches Einkommen: {profile.get('monatliches_einkommen'):.2f}€{RESET}")
+    print(f"{GREEN}Startdatum: {profile.get('startdatum')}{RESET}")
+    footer()
+
+
+def backup_data() -> None:
+    """Erstellt ein Backup der Daten."""
+    bak_dir = DATA_DIR / "backup"
+    bak_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    files_to_backup = [PROFILE_FILE, AUSGABEN_FILE, TRIGGER_FILE, SYSTEM_FILE, SPAR_FILE]
+    
+    count = 0
+    for fname in files_to_backup:
+        if fname.exists():
+            try:
+                shutil.copy(fname, bak_dir / f"{fname.stem}_{timestamp}.json")
+                count += 1
+            except Exception as e:
+                print(f"{RED}Fehler beim Backup von {fname.name}: {e}{RESET}")
+    
+    if count > 0:
+        print(f"{GREEN}Backup ({count} Dateien) erstellt in {bak_dir}{RESET}")
+    else:
+        print(f"{YELLOW}Keine Daten zum Sichern gefunden.{RESET}")
+
+
+def daily_zombie_bonus(profile: Dict) -> None:
+    """Gibt tägliche XP für Budget-Zombie-Bonus."""
+    klasse = profile.get("klasse")
+    if klasse != "Budget-Zombie":
+        return
+    # Wenn Budget-Zombie: 1 XP pro neuem Tag (letzter login < heute)
+    last = profile.get("last_login")
+    today = str(datetime.date.today())
+    
+    if last != today:
+        profile["xp"] += ZOMBIE_DAILY_XP
+        profile["last_login"] = today
+        print(f"{GREEN}🧟 Budget-Zombie Bonus: +{ZOMBIE_DAILY_XP} XP fürs Überleben heute!{RESET}")
+        # Hier wird noch nicht gespeichert, das passiert im Main Loop oder beim nächsten Speichern
+
+
+# -----------------------------
+# Export-Funktion (CSV)
+# -----------------------------
+def export_as_csv(ausgaben: List[Dict], trigger: List[Dict], profile: Dict) -> None:
+    """Exportiert Daten als CSV."""
+    exp_dir = DATA_DIR / "export"
+    exp_dir.mkdir(exist_ok=True)
+    
+    try:
+        import csv
+        
+        # Ausgaben
+        with open(exp_dir / "ausgaben.csv", "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["datum", "kategorie", "betrag", "fix", "original_betrag"])
+            for e in ausgaben:
+                writer.writerow([
+                    e.get("datum"), 
+                    e.get("kategorie"), 
+                    f"{e.get('betrag'):.2f}".replace('.', ','), 
+                    "1" if e.get("fix") else "0", 
+                    f"{e.get('original_betrag'):.2f}".replace('.', ',')
+                ])
+        
+        # Trigger
+        with open(exp_dir / "trigger.csv", "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["datum", "notiz"])
+            for t in trigger:
+                writer.writerow([t.get("datum"), t.get("notiz")])
+        
+        # Profile (als lesbarer Textdump)
+        with open(exp_dir / "profil.txt", "w", encoding="utf-8") as f:
+            f.write(json.dumps(profile, indent=2, ensure_ascii=False))
+        
+        print(f"{GREEN}Export fertig! Dateien liegen in: {exp_dir}{RESET}")
+        
+    except Exception as e:
+        print(f"{RED}Fehler beim Export: {e}{RESET}")
+
+
+# -----------------------------
+# Main Menü
+# -----------------------------
+def main_menu() -> None:
+    """Zeigt das Hauptmenü an."""
+    ensure_data_dir()
+    profile, ausgaben, trigger, system, spar = load_all()
+
+    # Setup if fresh
+    if not profile.get("klasse") or profile.get("name", "Unbenannt") == "Unbenannt":
+        set_profile_basic(profile)
+        save_json(PROFILE_FILE, profile)
+
+    # daily bonuses
+    daily_zombie_bonus(profile)
+
+    while True:
+        print()
+        header()
+        print(f"{GREEN}Hallo {profile.get('name')} — Typ: {profile.get('klasse')}  |  Level {profile.get('level')} ({profile.get('xp')} XP){RESET}")
+        print(GREEN + "-" * 40 + RESET)
+        print(f"{GREEN}1) Ausgabe eintragen{RESET}")
+        print(f"{GREEN}2) Monte-Carlo-Simulation (ETF Sparplan){RESET}")
+        print(f"{GREEN}3) Notiz / Trigger eintragen{RESET}")
+        print(f"{GREEN}4) Übersicht (Budget-Scanner){RESET}")
+        print(f"{GREEN}5) Profil anzeigen / Einkommen bearbeiten{RESET}")
+        print(f"{GREEN}6) Backup erstellen{RESET}")
+        print(f"{GREEN}7) Daten exportieren als CSV{RESET}")
+        print(f"{GREEN}8) Programm beenden (speichern){RESET}")
+        footer()
+
+        choice = input(f"{GREEN}Deine Auswahl: {RESET}").strip()
+        
+        if choice == "1":
+            neue_ausgabe(profile, ausgaben)
+        elif choice == "2":
+            neuer_sparplan(profile, spar)
+        elif choice == "3":
+            neuer_trigger(profile, trigger)
+        elif choice == "4":
+            # Hier war der Fehler in der Argumentliste im originalen Code
+            anzeigen(profile, ausgaben, spar, trigger)
+        elif choice == "5":
+            show_profile(profile)
+            sub = input(f"{GREEN}Möchtest du Einkommen ändern? (j/n): {RESET}").strip().lower()
+            if sub == "j":
+                add_income(profile)
+                save_json(PROFILE_FILE, profile)
+        elif choice == "6":
+            backup_data()
+        elif choice == "7":
+            export_as_csv(ausgaben, trigger, profile)
+        elif choice == "8":
+            # Save all and exit
+            save_json(PROFILE_FILE, profile)
+            save_json(AUSGABEN_FILE, ausgaben)
+            save_json(TRIGGER_FILE, trigger)
+            save_json(SYSTEM_FILE, system)
+            save_json(SPAR_FILE, spar)
+            print(f"{GREEN}💾 Daten gespeichert. Denk dran: Du bist mehr als deine Quittung.{RESET}")
+            break
+        else:
+            print(f"{GREEN}Ungültige Auswahl. Versuch's nochmal.{RESET}")
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print(f"\n{GREEN}Programm unterbrochen. Speichere Daten...{RESET}")
+        # attempt to save minimal safe state if variables exist
+        try:
+             # Reload just to be sure we have handles, though locally scoped vars might be lost
+             # Better to rely on functions having saved intermediate steps
+             print(f"{GREEN}Bye!{RESET}")
+        except:
+             pass
